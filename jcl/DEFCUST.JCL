@@ -1,11 +1,9 @@
 //**********************************************************************
-//* DEFINE CUSTOMER MASTER FILE
-//* This JCL defines the customer master file cluster and its index.
-//* It deletes any existing cluster and defines a new one with the specified index and data components.
-//* The cluster is defined with a key of 12 bytes and a record size of 200 bytes.
-//* The index component is named Z89616.BANK.CUSTMAST.INDEX and the data component is named Z89616.BANK.CUSTMAST.DATA.
-//* The cluster is allocated with 5 tracks for both the index and data components.
-//* The IDCAMS utility is used to delete and define the cluster.
+//* JOB: DEFCUST
+//* PURPOSE: DELETE AND REDEFINE CUSTOMER MASTER FILE
+//* NOTE: SAFE TO RERUN - DELETE NOT FOUND (RC 8) IS IGNORED
+//* AUTHOR: BLAKE MORGAN
+//* DATE: 2026-11-12
 //**********************************************************************
 //DEFCUST JOB (ACCT),CLASS=A,MSGCLASS=X,NOTIFY=&SYSUID
 //STEP10 EXEC PGM=IDCAMS
@@ -21,6 +19,8 @@
          KEYS(12 0)                          -
          RECORDSIZE(200 200)                 -
          TRACKS(5 5)                         -
+         SHAREOPTIONS(2 3)                   -
+         FREESPACE(20 10)                    -
           )                                  -
           INDEX                              -
          (NAME(Z89616.BANK.CUSTMAST.INDEX))  -
