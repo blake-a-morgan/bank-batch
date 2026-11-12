@@ -176,4 +176,4 @@ Compile and run steps for `CUSTLOAD` will be added in the next milestone.
 ## Author
 
 **Blake Morgan**, building toward a mainframe engineering role.
-<!-- Add your LinkedIn / contact link here -->
+<!-- https://www.linkedin.com/in/blake-morgan-123589164/ -->
