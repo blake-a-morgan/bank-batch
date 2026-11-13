@@ -24,7 +24,7 @@ The project follows the patterns used in production mainframe shops: shared copy
 - [x] **VSAM KSDS definition:** a rerunnable IDCAMS job (`DEFCUST`)
 - [x] **Seed input layout and test data:** the `CUSTIN` copybook and `data/CUSTIN.txt`
 - [x] **Load program written:** `CUSTLOAD` (sequential load into the KSDS)
-- [ ] Compile/link JCL, and run CUSTLOAD on z/OS
+- [x] Compile/link JCL, and run CUSTLOAD on z/OS
 - [ ] Daily transaction file and update program
 - [ ] Customer report with control breaks and totals
 - [ ] A single job stream: SORT, condition codes, GDGs

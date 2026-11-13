@@ -1,11 +1,11 @@
 //DEFCUST JOB (ACCT),CLASS=A,MSGCLASS=X,NOTIFY=&SYSUID
-//**********************************************************************
+//*********************************************************************
 //* JOB: DEFCUST
 //* PURPOSE: DELETE AND REDEFINE CUSTOMER MASTER FILE
 //* NOTE: SAFE TO RERUN - DELETE NOT FOUND (RC 8) IS IGNORED
 //* AUTHOR: BLAKE MORGAN
 //* DATE: 2026-11-12
-//**********************************************************************
+//*********************************************************************
 //STEP10 EXEC PGM=IDCAMS
 //SYSPRINT DD SYSOUT=*
 //SYSIN DD *
