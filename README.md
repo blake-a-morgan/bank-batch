@@ -24,7 +24,7 @@ The project follows the patterns used in production mainframe shops: shared copy
 - [x] **VSAM KSDS definition:** a rerunnable IDCAMS job (`DEFCUST`)
 - [x] **Seed input layout and test data:** the `CUSTIN` copybook and `data/CUSTIN.txt`
 - [x] **Load program written:** `CUSTLOAD` (sequential load into the KSDS)
-- [x] **Compile/link JCL, and run CUSTLOAD on z/OS:** `CUSTCMP` compiles and links `CUSTLOAD` then `CUSTRUN` loads the custin data into the CUSTMAST KSDS. `CUSTPRT` dumps the output into a sysprint to verify data was succesfully loaded.
+- [x] **Compile/link JCL, and run CUSTLOAD on z/OS:** `CUSTCMP` compiles and links `CUSTLOAD` then `CUSTRUN` loads the custin data into the CUSTMAST KSDS. `PRTCUST` dumps the output into a sysprint to verify data was successfully loaded.
 - [ ] Daily transaction file and update program
 - [ ] Customer report with control breaks and totals
 - [ ] A single job stream: SORT, condition codes, GDGs
@@ -35,20 +35,20 @@ The project follows the patterns used in production mainframe shops: shared copy
 ## How it works
 
 ```
-                 ┌──────────────┐
-                 │   DEFCUST    │  IDCAMS: DELETE / DEFINE CLUSTER
-                 │   (JCL)      │
-                 └──────┬───────┘
-                        │ creates
-                        ▼
- data/CUSTIN.txt   ┌──────────┐        ┌────────────────────────┐
- (text seed file) ─►│ CUSTLOAD │──WRITE─►│ Z89616.BANK.CUSTMAST   │
-   DD: CUSTIN      │ (COBOL)  │        │ VSAM KSDS, key = acct # │
-                   └──────────┘        │ DD: CUSTMAST           │
-                        │              └────────────────────────┘
-                        ▼
-              SYSOUT: read / written / rejected counts
-              RETURN-CODE: 0 / 4 / 16
+ 1. DEFCUST   IDCAMS DELETE / DEFINE CLUSTER ──────► empty KSDS BANK.CUSTMAST
+
+ 2. CUSTCMP   IGYWCL (compile + link-edit)
+              BANK.COBOL(CUSTLOAD) ─┐
+              BANK.COPYLIB ─────────┴──► BANK.LOADLIB(CUSTLOAD)
+
+ 3. CUSTRUN   EXEC PGM=CUSTLOAD  (STEPLIB = BANK.LOADLIB)
+              BANK.CUSTIN ──READ──► CUSTLOAD ──WRITE──► BANK.CUSTMAST
+              (DD CUSTIN, text)        │               (DD CUSTMAST, KSDS)
+                                       ▼
+                      SYSOUT: read / written / rejected counts
+                      RETURN-CODE: 0 / 4 / 16
+
+ 4. PRTCUST   IDCAMS PRINT ... DUMP ──► hex + character dump of every record
 ```
 
 ---
@@ -63,7 +63,10 @@ bank-batch/
 ├── data/
 │   └── CUSTIN.txt      Sample customers (fixed-width, 136 bytes/record)
 ├── jcl/
-│   └── DEFCUST.JCL     Delete and redefine the customer master KSDS
+│   ├── DEFCUST.JCL     Delete and redefine the customer master KSDS
+│   ├── CUSTCMP.JCL     Compile and link-edit CUSTLOAD
+│   ├── CUSTRUN.JCL     Run CUSTLOAD to load the KSDS
+│   └── PRTCUST.JCL     Dump the KSDS contents for verification
 └── src/
     └── CUSTLOAD.cbl    Load the KSDS from the seed file
 ```
@@ -112,6 +115,69 @@ Reads the text seed file and writes each customer to the KSDS in key order.
 
   A warning code never overwrites a more serious one that has already been set.
 
+### `CUSTCMP.JCL`: compile and link-edit
+
+Calls IBM's **`IGYWCL`** procedure and overrides its DD statements to point at the project libraries:
+
+| Override | Points to |
+|---|---|
+| `COBOL.SYSIN` | Source member `BANK.COBOL(CUSTLOAD)` |
+| `COBOL.SYSLIB` | `BANK.COPYLIB`, resolving `COPY CUSTIN` / `COPY CUSTREC` |
+| `LKED.SYSLMOD` | Output program object `BANK.LOADLIB(CUSTLOAD)` |
+
+Dataset names use `&SYSUID`, so the job works for any user ID without editing.
+
+### `CUSTRUN.JCL`: run the load
+
+| DD | Dataset | DISP | Why |
+|---|---|---|---|
+| `STEPLIB` | `BANK.LOADLIB` | `SHR` | Where z/OS finds `CUSTLOAD` (otherwise abend S806) |
+| `CUSTIN` | `BANK.CUSTIN` | `SHR` | Read-only input; safe to share |
+| `CUSTMAST` | `BANK.CUSTMAST` | `OLD` | Exclusive use, so no job can read a half-loaded file |
+| `SYSOUT` | `SYSOUT=*` | | Run summary from `DISPLAY` |
+
+DD names match the program's `ASSIGN TO` clauses.
+
+### `PRTCUST.JCL`: verify the load
+
+Runs `IDCAMS PRINT INDATASET(...) DUMP`, which prints every KSDS record in hex and characters. This checks the load independently of the program's own counts. In particular, it shows that the money fields really are packed decimal.
+
+---
+
+## Results
+
+`CUSTRUN` output (`CC 0000`):
+
+```
+ RECORDS READ: 00006
+ RECORDS WRITTEN: 00006
+ RECORDS REJECTED: 00000
+ ALL RECORDS PROCESSED SUCCESSFULLY
+```
+
+`PRTCUST` dump excerpt for account `000000100002`. The balance at offset 99 (`X'63'`) is `00 00 07 55 0D`, packed decimal for **−75.50** (sign nibble `D` = negative):
+
+```
+ 000060  F2F0F500 0007550D 00025000 0CC1F2F0 ...   *205.......&..A20...*
+```
+
+IDCAMS reported `NUMBER OF RECORDS PROCESSED WAS 6`, which matches the program's count.
+
+---
+
+## Mainframe datasets
+
+| Dataset | Type | RECFM | LRECL | BLKSIZE | Contents |
+|---|---|---|---|---|---|
+| `BANK.COBOL` | PDSE | FB | 80 | 27920 | COBOL source |
+| `BANK.COPYLIB` | PDSE | FB | 80 | 27920 | Copybooks |
+| `BANK.JCL` | PDSE | FB | 80 | 27920 | JCL |
+| `BANK.LOADLIB` | PDSE | U | 0 | 32760 | Program objects (Enterprise COBOL V5+ requires PDSE) |
+| `BANK.CUSTIN` | PS | FB | 136 | 27880 | Seed input data |
+| `BANK.CUSTMAST` | VSAM KSDS | | 200 | | Customer master |
+
+Block sizes are the largest multiple of LRECL that fits in a 3390 half-track (27998 bytes).
+
 ---
 
 ## Record layouts
@@ -159,21 +225,33 @@ The six test customers in `data/CUSTIN.txt` cover a normal account, negative bal
 
 ## Running it
 
-Prerequisites: Zowe CLI configured with a z/OSMF profile for your z/OS system. Replace `Z89616` in the JCL with your own high-level qualifier.
+Prerequisites: Zowe CLI configured with a z/OSMF profile for your z/OS system, and the libraries above allocated. Replace `Z89616` with your own high-level qualifier in `DEFCUST.JCL`, `PRTCUST.JCL` and the commands below. The other jobs use `&SYSUID`.
 
 ```powershell
-# Define (or redefine) the customer master KSDS
+# 1. Upload source, copybooks and seed data
+zowe zos-files upload file-to-data-set "src/CUSTLOAD.cbl"     "Z89616.BANK.COBOL(CUSTLOAD)"
+zowe zos-files upload file-to-data-set "copybooks/CUSTIN.cpy"  "Z89616.BANK.COPYLIB(CUSTIN)"
+zowe zos-files upload file-to-data-set "copybooks/CUSTREC.cpy" "Z89616.BANK.COPYLIB(CUSTREC)"
+zowe zos-files upload file-to-data-set "data/CUSTIN.txt"       "Z89616.BANK.CUSTIN"
+
+# 2. Define (or redefine) the customer master KSDS
 zowe zos-jobs submit local-file "jcl/DEFCUST.JCL" --view-all-spool-content
 
-# Confirm the cluster and its DATA/INDEX components exist
-zowe zos-files list data-set "Z89616.BANK.**"
+# 3. Compile and link-edit CUSTLOAD
+zowe zos-jobs submit local-file "jcl/CUSTCMP.JCL" --view-all-spool-content
+
+# 4. Load the KSDS
+zowe zos-jobs submit local-file "jcl/CUSTRUN.JCL" --view-all-spool-content
+
+# 5. Verify the contents
+zowe zos-jobs submit local-file "jcl/PRTCUST.JCL" --view-all-spool-content
 ```
 
-Compile and run steps for `CUSTLOAD` will be added in the next milestone.
+> **Rerunning the load:** run `DEFCUST` before `CUSTRUN`. `CUSTLOAD` opens the KSDS for `OUTPUT`, which expects an empty cluster.
 
 ---
 
 ## Author
 
 **Blake Morgan**, building toward a mainframe engineering role.
-<!-- https://www.linkedin.com/in/blake-morgan-123589164/ -->
+[LinkedIn](https://www.linkedin.com/in/blake-morgan-123589164/)
