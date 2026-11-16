@@ -1,0 +1,12 @@
+//CUSTRUN JOB (ACCT),CLASS=A,MSGCLASS=X,NOTIFY=&SYSUID
+//*********************************************************************
+//* JOB: CUSTRUN
+//* PURPOSE: LOAD CUSTOMER MASTER KSDS FROM CUSTIN
+//* AUTHOR: BLAKE MORGAN
+//* DATE: 2026-11-16
+//*********************************************************************
+//STEP10   EXEC PGM=CUSTLOAD
+//STEPLIB  DD   DSN=&SYSUID..BANK.LOADLIB,DISP=SHR
+//CUSTIN   DD   DSN=&SYSUID..BANK.CUSTIN,DISP=SHR
+//CUSTMAST DD   DSN=&SYSUID..BANK.CUSTMAST,DISP=OLD
+//SYSOUT   DD   SYSOUT=*
