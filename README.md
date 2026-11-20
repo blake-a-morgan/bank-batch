@@ -25,7 +25,7 @@ The project follows the patterns used in production mainframe shops: shared copy
 - [x] **Seed input layout and test data:** the `CUSTIN` copybook and `data/CUSTIN.txt`
 - [x] **Load program written:** `CUSTLOAD` (sequential load into the KSDS)
 - [x] **Compile/link JCL, and run CUSTLOAD on z/OS:** `CUSTCMP` compiles and links `CUSTLOAD` then `CUSTRUN` loads the custin data into the CUSTMAST KSDS. `PRTCUST` dumps the output into a sysprint to verify data was successfully loaded.
-- [ ] Daily transaction file and update program
+- [x] **Daily transaction update:** the `TRANREC` / `REJREC` copybooks, the `CUSTUPD` program (random-access VSAM update with 10 business rules and a reject file), and the `UPDCMP` / `UPDRUN` jobs. Verified against a 23-transaction test plan.
 - [ ] Customer report with control breaks and totals
 - [ ] A single job stream: SORT, condition codes, GDGs
 - [ ] Automation with Zowe CLI
@@ -49,6 +49,23 @@ The project follows the patterns used in production mainframe shops: shared copy
                       RETURN-CODE: 0 / 4 / 16
 
  4. PRTCUST   IDCAMS PRINT ... DUMP ──► hex + character dump of every record
+
+ 5. UPDCMP    IGYWCL ──► BANK.LOADLIB(CUSTUPD)
+
+ 6. UPDRUN    STEP05  IEFBR14: delete yesterday's reject file (if any)
+              STEP10  EXEC PGM=CUSTUPD
+                                         ┌──READ by key──┐
+              BANK.TRANIN ──READ──► CUSTUPD          BANK.CUSTMAST
+              (DD TRANIN)              │  └──REWRITE───┘  (DD CUSTMAST, I-O)
+                                       │
+                        valid ◄────────┴────────► invalid
+                    balance/status                 BANK.TRANREJ
+                    updated in KSDS                (DD REJOUT: txn + reason code)
+                                       ▼
+                      SYSOUT: read / applied / rejected counts
+                      RETURN-CODE: 0 / 4 / 16
+
+ 7. PRTCUST   dump again and compare against the expected results
 ```
 
 ---
@@ -59,16 +76,22 @@ The project follows the patterns used in production mainframe shops: shared copy
 bank-batch/
 ├── copybooks/
 │   ├── CUSTREC.cpy     Customer master record (KSDS layout)
-│   └── CUSTIN.cpy      Seed input record (text layout)
+│   ├── CUSTIN.cpy      Seed input record (text layout)
+│   ├── TRANREC.cpy     Daily transaction record (41 bytes)
+│   └── REJREC.cpy      Rejected transaction record (86 bytes)
 ├── data/
-│   └── CUSTIN.txt      Sample customers (fixed-width, 136 bytes/record)
+│   ├── CUSTIN.txt      Sample customers (fixed-width, 136 bytes/record)
+│   └── TRANIN.txt      Test transactions (fixed-width, 41 bytes/record)
 ├── jcl/
 │   ├── DEFCUST.JCL     Delete and redefine the customer master KSDS
 │   ├── CUSTCMP.JCL     Compile and link-edit CUSTLOAD
 │   ├── CUSTRUN.JCL     Run CUSTLOAD to load the KSDS
-│   └── PRTCUST.JCL     Dump the KSDS contents for verification
+│   ├── PRTCUST.JCL     Dump the KSDS contents for verification
+│   ├── UPDCMP.JCL      Compile and link-edit CUSTUPD
+│   └── UPDRUN.JCL      Run CUSTUPD to apply the day's transactions
 └── src/
-    └── CUSTLOAD.cbl    Load the KSDS from the seed file
+    ├── CUSTLOAD.cbl    Load the KSDS from the seed file
+    └── CUSTUPD.cbl     Apply transactions to the KSDS, write rejects
 ```
 
 ---
@@ -142,6 +165,62 @@ DD names match the program's `ASSIGN TO` clauses.
 
 Runs `IDCAMS PRINT INDATASET(...) DUMP`, which prints every KSDS record in hex and characters. This checks the load independently of the program's own counts. In particular, it shows that the money fields really are packed decimal.
 
+### `CUSTUPD.cbl`: apply the day's transactions
+
+Reads the transaction file in sequence. For each transaction it reads the matching customer **by key** (`ACCESS RANDOM`, `OPEN I-O`), validates the transaction, then either updates the record with `REWRITE` or writes it to the reject file with a reason code. One bad transaction never stops the run.
+
+**Transaction types**
+
+| Type | Meaning | Effect on the customer record |
+|---|---|---|
+| `D` | Deposit | balance + amount |
+| `W` | Withdrawal | balance − amount |
+| `F` | Fee | balance − amount |
+| `I` | Interest | balance + amount |
+| `S` | Status change | status ← new status (`A` / `F` / `C`) |
+
+Every applied transaction also sets the last-activity date to the transaction's date. The program uses the **business date**, not the system clock, so reruns and after-midnight runs stamp the correct day.
+
+**Business rules:** the first rule that fails decides the reject reason.
+
+| Code | Applies to | Reject when |
+|---|---|---|
+| R01 | all | Account not found (VSAM status `23`) |
+| R02 | all | Transaction type is not D/W/F/I/S |
+| R03 | D, W, F, I | Amount is non-numeric or zero |
+| R04 | D, W, F, I | Account is closed |
+| R05 | W | Account is frozen |
+| R06 | W | Balance is already negative |
+| R07 | W | New balance would be below −(credit limit) |
+| R08 | I | Account is frozen or the balance is negative |
+| R09 | S | New status is not A/F/C |
+| R10 | S | Closing an account with a non-zero balance |
+
+**Design points**
+
+- **Layered validation with a single switch.** `2100` looks up the account, `2200` runs the checks common to all types, and `2300` runs the type-specific checks. Each layer runs only if the transaction is still valid. One final `IF` either applies it (`2400`) or rejects it (`2900`), so each counter and each write happens in exactly one place.
+- **No S0C7 on bad input.** The amount is checked with a `NUMERIC` class test *before* any comparison or arithmetic. The test data includes a non-numeric amount (`00012AB00`), which is rejected with R03 instead of abending the job.
+- **The reject record keeps the original transaction.** All 41 bytes are copied with one group `MOVE`, so the record can be corrected and resubmitted. Copying it as plain bytes also means bad numeric data can't cause an abend.
+- **FILE STATUS is checked after every READ, REWRITE and WRITE.** Status `23` on the master is a business reject (R01). Any other unexpected status is fatal: the program displays it, closes all files, and ends with RC 16.
+
+| RC | Meaning |
+|---|---|
+| 0 | All transactions applied |
+| 4 | Run finished, but some transactions were rejected (see `BANK.TRANREJ`) |
+| 16 | Open or I/O failure, so the run is incomplete |
+
+### `UPDRUN.JCL`: run the update
+
+| Step | DD | Dataset | DISP | Why |
+|---|---|---|---|---|
+| `STEP05` (`IEFBR14`) | `REJOUT` | `BANK.TRANREJ` | `(MOD,DELETE,DELETE)` | Deletes the previous reject file whether or not it exists, so the job is safe to rerun |
+| `STEP10` (`CUSTUPD`) | `STEPLIB` | `BANK.LOADLIB` | `SHR` | Program location |
+| | `TRANIN` | `BANK.TRANIN` | `SHR` | Read-only input |
+| | `CUSTMAST` | `BANK.CUSTMAST` | `OLD` | Exclusive, because the master is being updated |
+| | `REJOUT` | `BANK.TRANREJ` | `(NEW,CATLG,DELETE)` | Created by the step; deleted if the step abends |
+
+`UPDCMP.JCL` is the same as `CUSTCMP.JCL`, but it compiles `CUSTUPD`.
+
 ---
 
 ## Results
@@ -163,6 +242,50 @@ Runs `IDCAMS PRINT INDATASET(...) DUMP`, which prints every KSDS record in hex a
 
 IDCAMS reported `NUMBER OF RECORDS PROCESSED WAS 6`, which matches the program's count.
 
+### Transaction update (`UPDRUN`)
+
+`data/TRANIN.txt` is a test plan: 23 transactions, each designed to test one rule, with the expected outcome worked out **before** the program was run. It covers every reject code, plus these cases:
+
+- **Order matters:** a withdrawal from a frozen account is rejected (R05). A status change then unfreezes the account, and the same withdrawal is applied. This shows that each transaction sees the updated record.
+- **Exact boundary:** a withdrawal that leaves the balance *exactly* at −(credit limit) is applied, while one that goes 1 cent past it is rejected (R07).
+- **Rules apply only to their own types:** status changes carry a zero amount and must *not* be rejected by R03.
+
+`UPDRUN` output (`STEP05 CC 0000`, `STEP10 CC 0004`):
+
+```
+ RECORDS READ: 00023
+ RECORDS APPLIED: 00011
+ RECORDS REJECTED: 00012
+```
+
+Reject file `BANK.TRANREJ` (original transaction, reason code, description):
+
+```
+000000100001X000001000 20261116T000000004 R02 INVALID TRANSACTION TYPE
+000000100001D000000000 20261116T000000005 R03 AMOUNT MUST BE GREATER THAN ZERO
+000000100001D00012AB00 20261116T000000006 R03 AMOUNT NOT NUMERIC
+000000100001W001483014 20261116T000000007 R07 WITHDRAWAL EXCEEDS CREDIT LIMIT
+000000100002W000001000 20261116T000000009 R06 INSUFFICIENT FUNDS FOR WITHDRAWAL
+000000100002I000000100 20261116T000000010 R08 NO INTEREST: FROZEN OR NEGATIVE BALANCE
+000000100003W000010000 20261116T000000011 R05 WITHDRAWAL NOT ALLOWED: FROZEN ACCOUNT
+000000100003I000002000 20261116T000000013 R08 NO INTEREST: FROZEN OR NEGATIVE BALANCE
+000000100004D000010000 20261116T000000016 R04 INVALID ACTIONS FOR CLOSED ACCOUNT
+000000100004S000000000C20261116T000000019 R10 CANNOT CLOSE ACCOUNT:NON ZERO BALANCE
+000000100005S000000000X20261116T000000021 R09 INVALID NEW STATUS
+999999999999D000010000 20261116T000000023 R01 ACCOUNT NOT FOUND
+```
+
+Customer master before and after, decoded from the `PRTCUST` hex dumps. All six records match the expected results, and every record's last-activity date was set to `20261116`:
+
+| Account | Before | After | Status | Packed balance after (offset 99) |
+|---|---:|---:|---|---|
+| Chen | 4,525.30 | 4,830.13 | A | `00 04 83 01 3C` |
+| Okafor | −75.50 | −100.50 | A | `00 00 10 05 0D` |
+| Martinez | 21,500.00 | 21,650.00 | F → **A** | `00 21 65 00 0C` |
+| Whitaker | 0.00 | 50.00 | C → **A** | `00 00 05 00 0C` |
+| Nair | 988.12 | −3,000.00 | A | `00 03 00 00 0D` |
+| Hayes | −1,200.00 | −1,235.00 | F | `00 01 23 50 0D` |
+
 ---
 
 ## Mainframe datasets
@@ -175,6 +298,8 @@ IDCAMS reported `NUMBER OF RECORDS PROCESSED WAS 6`, which matches the program's
 | `BANK.LOADLIB` | PDSE | U | 0 | 32760 | Program objects (Enterprise COBOL V5+ requires PDSE) |
 | `BANK.CUSTIN` | PS | FB | 136 | 27880 | Seed input data |
 | `BANK.CUSTMAST` | VSAM KSDS | | 200 | | Customer master |
+| `BANK.TRANIN` | PS | FB | 41 | 27962 | Daily transactions |
+| `BANK.TRANREJ` | PS | FB | 86 | 27950 | Rejected transactions (created by `UPDRUN`) |
 
 Block sizes are the largest multiple of LRECL that fits in a 3390 half-track (27998 bytes).
 
@@ -217,9 +342,30 @@ The same fields as `CUSTREC`, but every field is plain text, so the file can be 
 | 121–128 | Open date |
 | 129–136 | Last activity date |
 
+### Transaction: `TRANREC` (sequential text, 41 bytes)
+
+| Columns | Field | PIC | Notes |
+|---|---|---|---|
+| 1–12 | `TRAN-ACC-NO` | `X(12)` | Customer key |
+| 13 | `TRAN-TYPE` | `X(1)` | `D` `W` `F` `I` `S` (88-levels) |
+| 14–22 | `TRAN-AMOUNT` | `9(7)V99` | Unsigned; the type decides the direction |
+| 23 | `TRAN-NEW-STATUS` | `X(1)` | Used only by `S` transactions |
+| 24–31 | `TRAN-DATE` | `9(8)` | `YYYYMMDD`, the business date |
+| 32–41 | `TRAN-ID` | `X(10)` | Unique transaction reference |
+
+### Rejected transaction: `REJREC` (sequential text, 86 bytes)
+
+| Columns | Field | PIC | Notes |
+|---|---|---|---|
+| 1–41 | `REJ-TRAN-DATA` | `X(41)` | The original transaction, byte for byte |
+| 42 | `FILLER` | `X(1)` | Space |
+| 43–45 | `REJ-REASON-CODE` | `X(3)` | `R01`–`R10` |
+| 46 | `FILLER` | `X(1)` | Space |
+| 47–86 | `REJ-REASON-DESC` | `X(40)` | Readable explanation |
+
 ### Sample data
 
-The six test customers in `data/CUSTIN.txt` cover a normal account, negative balances, frozen and closed accounts, a zero balance, an account over its credit limit, and a ZIP code with a leading zero.
+The six test customers in `data/CUSTIN.txt` cover a normal account, negative balances, frozen and closed accounts, a zero balance, an account over its credit limit, and a ZIP code with a leading zero. The 23 transactions in `data/TRANIN.txt` are described under [Results](#transaction-update-updrun).
 
 ---
 
@@ -245,9 +391,23 @@ zowe zos-jobs submit local-file "jcl/CUSTRUN.JCL" --view-all-spool-content
 
 # 5. Verify the contents
 zowe zos-jobs submit local-file "jcl/PRTCUST.JCL" --view-all-spool-content
+
+# 6. Upload the transaction program, copybooks and test transactions
+zowe zos-files upload file-to-data-set "src/CUSTUPD.cbl"       "Z89616.BANK.COBOL(CUSTUPD)"
+zowe zos-files upload file-to-data-set "copybooks/TRANREC.cpy" "Z89616.BANK.COPYLIB(TRANREC)"
+zowe zos-files upload file-to-data-set "copybooks/REJREC.cpy"  "Z89616.BANK.COPYLIB(REJREC)"
+zowe zos-files upload file-to-data-set "data/TRANIN.txt"       "Z89616.BANK.TRANIN"
+
+# 7. Compile CUSTUPD, apply the transactions, and verify
+zowe zos-jobs submit local-file "jcl/UPDCMP.JCL" --view-all-spool-content
+zowe zos-jobs submit local-file "jcl/UPDRUN.JCL" --view-all-spool-content
+zowe zos-files view data-set "Z89616.BANK.TRANREJ"
+zowe zos-jobs submit local-file "jcl/PRTCUST.JCL" --view-all-spool-content
 ```
 
 > **Rerunning the load:** run `DEFCUST` before `CUSTRUN`. `CUSTLOAD` opens the KSDS for `OUTPUT`, which expects an empty cluster.
+>
+> **Rerunning the update:** run `DEFCUST`, then `CUSTRUN`, then `UPDRUN`. Applying the same transactions twice to the same master would post them twice (for example, a second +$500 deposit).
 
 ---
 
