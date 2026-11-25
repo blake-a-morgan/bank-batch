@@ -1,0 +1,72 @@
+=====================================================================
+ CUSTPRT - CUSTOMER BALANCE REPORT : LAYOUT AND EXPECTED OUTPUT
+=====================================================================
+
+DESIGN DECISIONS
+----------------
+Break field : CUST-ACCT-STATUS (A = active, F = frozen, C = closed)
+              Not state: every test customer is in a different state,
+              so a state break would make a "group" of one customer
+              each time and would not really test the break logic.
+Sort order  : status, then account number (DFSORT step before the
+              program - the KSDS itself is in account-number order)
+Columns     : account, name, state, balance, credit limit,
+              last activity date
+Totals      : per status group - account count and total balance
+              grand total     - account count and total balance,
+                                plus counts for active/frozen/closed
+Line width  : 132 print positions (only 1-95 used)
+
+MOCK-UP (balances after UPDRUN on 2026-11-16 test data)
+-------------------------------------------------------
+         1         2         3         4         5         6         7         8         9
+123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456
+RUN DATE: 2026-11-20             BANK BATCH - CUSTOMER BALANCE REPORT                PAGE:    1
+
+ACCOUNT        NAME                             ST         BALANCE   CREDIT LIMIT     LAST ACT
+------------   ------------------------------   --   -------------   ------------   ----------
+000000100001   CHEN, MARGARET                   TX       4,830.13       10,000.00   2026-11-16
+000000100002   OKAFOR, DAVID R                  OR         100.50-       2,500.00   2026-11-16
+000000100003   MARTINEZ, SOFIA                  IL      21,650.00       50,000.00   2026-11-16
+000000100004   WHITAKER, JAMES T                OH          50.00        5,000.00   2026-11-16
+000000100005   NAIR, PRIYA                      CA       3,000.00-       3,000.00   2026-11-16
+
+     STATUS A - ACTIVE      ACCOUNTS:      5            23,429.63 
+
+000000100006   HAYES, ROBERT                    VT       1,235.00-       1,000.00   2026-11-16
+
+     STATUS F - FROZEN      ACCOUNTS:      1             1,235.00-
+
+                                                ==================
+     GRAND TOTAL            ACCOUNTS:      6            22,194.63 
+
+     ACTIVE:     5     FROZEN:     1     CLOSED:     0
+
+                         *** END OF REPORT ***
+
+EXPECTED RESULTS (check these against the real run)
+---------------------------------------------------
+Group A : 5 accounts   4,830.13 - 100.50 + 21,650.00 + 50.00 - 3,000.00
+                       = 23,429.63
+Group F : 1 account   -1,235.00
+Group C : no records -> no group total line is printed for C
+Grand   : 6 accounts   23,429.63 - 1,235.00 = 22,194.63
+Status counts: active 5, frozen 1, closed 0
+
+FIELD SIZES (so totals cannot overflow)
+---------------------------------------
+Customer balance  S9(7)V99  -> edited  Z,ZZZ,ZZ9.99-        (13 chars)
+Credit limit      S9(7)V99  -> edited  Z,ZZZ,ZZ9.99         (12 chars)
+Total balance     S9(11)V99 COMP-3 accumulator
+                            -> edited  ZZ,ZZZ,ZZZ,ZZ9.99-   (18 chars)
+                  Room for up to 99,999,999,999.99 - enough for
+                  10,000 customers at the maximum balance each.
+Account counts    9(5)      -> edited  ZZ,ZZ9 / ZZZZ9
+
+CONTROL BREAK RULES
+-------------------
+1. Print headings at the top of every page (and on page 1).
+2. When the status changes: print the previous group's total line,
+   reset the group count and group balance, then process the record.
+3. At end of file: print the LAST group's total, then the grand totals.
+4. Group totals roll into the grand total.
